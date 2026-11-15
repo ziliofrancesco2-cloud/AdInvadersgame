@@ -1,0 +1,478 @@
+diff -ruN -U1 -x .github -x '*.zip' -x README.md old/AdInvaders/app/src/main/AndroidManifest.xml AdInvaders/app/src/main/AndroidManifest.xml
+--- old/AdInvaders/app/src/main/AndroidManifest.xml
++++ AdInvaders/app/src/main/AndroidManifest.xml
+@@ -5,6 +5,7 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
++    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+ 
+     <application
+         android:allowBackup="true"
+@@ -15,7 +16,8 @@
+         <activity
+             android:name=".MainActivity"
+             android:exported="true"
+-            android:screenOrientation="portrait">
++            android:resizeableActivity="true"
++            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboardHidden">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+                 <category android:name="android.intent.category.LAUNCHER" />
+diff -ruN -U1 -x .github -x '*.zip' -x README.md old/AdInvaders/app/src/main/java/com/crowclaw/adinvaders/AdBlockVpnService.kt AdInvaders/app/src/main/java/com/crowclaw/adinvaders/AdBlockVpnService.kt
+--- old/AdInvaders/app/src/main/java/com/crowclaw/adinvaders/AdBlockVpnService.kt
++++ AdInvaders/app/src/main/java/com/crowclaw/adinvaders/AdBlockVpnService.kt
+@@ -45,6 +45,8 @@
+     private var pool: ExecutorService? = null
+     private val lastEmit = ConcurrentHashMap<String, Long>()
+     private val vpnDnsBytes = InetAddress.getByName(VPN_DNS).address
++    private var overlay: ShipOverlay? = null
++    private val overlayListener = BlockEvents.Listener { overlay?.show(it) }
+ 
+     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+         if (intent?.action == ACTION_STOP) {
+@@ -72,6 +74,8 @@
+         out = FileOutputStream(fd.fileDescriptor)
+         pool = Executors.newFixedThreadPool(8)
+         BlockEvents.vpnRunning = true
++        overlay = ShipOverlay(this)
++        BlockEvents.add(overlayListener)
+ 
+         worker = Thread({
+             val input = FileInputStream(fd.fileDescriptor)
+@@ -89,6 +93,8 @@
+ 
+     private fun stopVpn() {
+         BlockEvents.vpnRunning = false
++        BlockEvents.remove(overlayListener)
++        overlay?.hide(); overlay = null
+         worker?.interrupt(); worker = null
+         pool?.shutdownNow(); pool = null
+         try { tun?.close() } catch (_: Exception) {}
+diff -ruN -U1 -x .github -x '*.zip' -x README.md old/AdInvaders/app/src/main/java/com/crowclaw/adinvaders/GameView.kt AdInvaders/app/src/main/java/com/crowclaw/adinvaders/GameView.kt
+--- old/AdInvaders/app/src/main/java/com/crowclaw/adinvaders/GameView.kt
++++ AdInvaders/app/src/main/java/com/crowclaw/adinvaders/GameView.kt
+@@ -15,7 +15,12 @@
+  * Schermata di gioco retro: ogni annuncio bloccato diventa un invasore pixel
+  * che scende dall'alto; la navicella lo insegue e lo abbatte.
+  */
+-class GameView(context: Context) : View(context) {
++class GameView(context: Context, private val overlay: Boolean = false) : View(context) {
++
++    /** Solo in modalità overlay: chiamato quando la navicella è uscita di scena. */
++    var onIdle: (() -> Unit)? = null
++    private var shipOffset = 0f        // spostamento verticale per entrata/uscita (overlay)
++    private var idleTime = 0f
+ 
+     // ---------- sprite pixel art ----------
+     private val shipSprite = arrayOf(
+@@ -46,7 +51,11 @@
+     )
+ 
+     private val dp = resources.displayMetrics.density
+-    private val px = 3f * dp                      // dimensione di un "pixel" retro
++    // Dimensione di un "pixel" retro e scala dell'interfaccia: crescono con lo schermo
++    // (telefono = 1x, tablet grande ≈ 1.6x), ricalcolate a ogni rotazione o split screen.
++    private var ui = 1f
++    private var px = 3f * dp
++    private val u get() = dp * ui   // dp scalato per tablet
+     private val palette = intArrayOf(
+         Color.parseColor("#FF3BD4"), Color.parseColor("#FFD23B"),
+         Color.parseColor("#3BC8FF"), Color.parseColor("#FF6B3B"),
+@@ -93,12 +102,22 @@
+ 
+     // ---------- loop ----------
+     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
++        val minDp = minOf(w, h) / dp
++        ui = (minDp / 400f).coerceIn(1f, 1.8f)
++        px = 3f * dp * ui
++        // riporta gli invasori dentro lo schermo dopo una rotazione
++        val margin = 70 * dp * ui
++        for (inv in invaders) {
++            inv.x = inv.x.coerceIn(margin, (w - margin).coerceAtLeast(margin))
++            inv.y = inv.y.coerceAtMost(h * 0.5f)
++        }
+         stars.clear()
+-        repeat(90) {
++        repeat((90 * (w * h) / (400f * 800f * dp * dp)).toInt().coerceIn(90, 260)) {
+             stars += Star(Random.nextFloat() * w, Random.nextFloat() * h,
+                 (20 + Random.nextFloat() * 120) * dp, if (Random.nextInt(5) == 0) 2 * dp else dp)
+         }
+         shipX = w / 2f
++        if (overlay) shipOffset = 260 * u   // parte fuori dallo schermo, in basso
+     }
+ 
+     override fun onDraw(canvas: Canvas) {
+@@ -107,24 +126,27 @@
+         lastFrame = now
+         update(dt)
+ 
+-        canvas.drawColor(Color.parseColor("#05030F"))
++        if (!overlay) canvas.drawColor(Color.parseColor("#05030F"))
+         canvas.save()
+         if (shake > 0) canvas.translate((Random.nextFloat() - .5f) * shake, (Random.nextFloat() - .5f) * shake)
+ 
+-        drawStars(canvas)
++        if (!overlay) drawStars(canvas)
+         drawInvaders(canvas)
+         drawBullets(canvas)
+         drawParticles(canvas)
+         drawShip(canvas)
+         drawPopups(canvas)
+         canvas.restore()
+-        drawHud(canvas)
+-        drawScanlines(canvas)
++        if (!overlay) { drawHud(canvas); drawScanlines(canvas) }
+ 
++        if (overlay && shipOffset >= 260 * u && invaders.isEmpty() && pending.isEmpty() && particles.isEmpty()) {
++            onIdle?.invoke()
++            return
++        }
+         postInvalidateOnAnimation()
+     }
+ 
+-    private val shipY get() = height - 150 * dp
++    private val shipY get() = (if (overlay) height - 110 * u else height - 175 * dp - 50 * u) + shipOffset
+ 
+     private fun update(dt: Float) {
+         time += dt
+@@ -132,17 +154,28 @@
+ 
+         for (s in stars) { s.y += s.speed * dt; if (s.y > height) { s.y = 0f; s.x = Random.nextFloat() * width } }
+ 
++        // Overlay: la navicella entra quando arrivano annunci ed esce dopo 2,5 s di calma
++        if (overlay) {
++            val busy = invaders.isNotEmpty() || pending.isNotEmpty()
++            idleTime = if (busy) 0f else idleTime + dt
++            val goalOff = if (busy || idleTime < 2.5f) 0f else 260 * u
++            val step = 700 * u * dt
++            shipOffset += (goalOff - shipOffset).coerceIn(-step, step)
++        }
++
+         // Fa entrare i nuovi invasori uno alla volta
+         spawnTimer -= dt
+-        if (spawnTimer <= 0 && pending.isNotEmpty() && invaders.size < 10) {
+-            val margin = 70 * dp
++        if (spawnTimer <= 0 && pending.isNotEmpty() && invaders.size < 10 && (!overlay || shipOffset < 40 * u)) {
++            val margin = 70 * u
++            // sul sito compaiono sparsi nella metà alta della pagina, dove stavano gli annunci
++            val startY = if (overlay) height * (0.12f + Random.nextFloat() * 0.35f) else 90 * u
+             invaders += Invader(pending.removeFirst(),
+-                margin + Random.nextFloat() * (width - 2 * margin), 90 * dp,
++                margin + Random.nextFloat() * (width - 2 * margin), startY,
+                 palette.random(), Random.nextFloat() * 6f)
+             spawnTimer = 0.35f
+         }
+ 
+-        val fall = 28 * dp
++        val fall = 28 * u
+         for (inv in invaders) inv.y += fall * dt
+ 
+         // La navicella insegue l'invasore più basso (pilota automatico)
+@@ -150,37 +183,38 @@
+         val goal = when {
+             target != null -> invaderX(target)
+             targetX >= 0 -> targetX
++            overlay -> shipX
+             else -> width / 2f + sin(time * 0.8f) * width * 0.25f
+         }
+         val dx = goal - shipX
+-        shipX += dx.coerceIn(-420 * dp * dt, 420 * dp * dt)
++        shipX += dx.coerceIn(-420 * u * dt, 420 * u * dt)
+ 
+         cooldown -= dt
+-        if (target != null && abs(dx) < 14 * dp && cooldown <= 0) fire()
++        if (target != null && abs(dx) < 14 * u && cooldown <= 0) fire()
+ 
+         // Proiettili
+         val bIt = bullets.iterator()
+         while (bIt.hasNext()) {
+             val b = bIt.next()
+-            b.y -= 900 * dp * dt
++            b.y -= 900 * u * dt
+             if (b.y < 0) { bIt.remove(); continue }
+             val hit = invaders.firstOrNull { abs(invaderX(it) - b.x) < 6 * px && b.y in it.y..(it.y + 6 * px) }
+             if (hit != null) { bIt.remove(); explode(hit) }
+         }
+         // Se un invasore arriva troppo in basso esplode comunque: è già bloccato!
+-        invaders.filter { it.y > shipY - 30 * dp }.forEach { explode(it) }
++        invaders.filter { it.y > shipY - 30 * u }.forEach { explode(it) }
+ 
+         val pIt = particles.iterator()
+         while (pIt.hasNext()) {
+             val p = pIt.next()
+-            p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dp * dt; p.life -= dt
++            p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * u * dt; p.life -= dt
+             if (p.life <= 0) pIt.remove()
+         }
+         val uIt = popups.iterator()
+-        while (uIt.hasNext()) { val u = uIt.next(); u.y -= 40 * dp * dt; u.life -= dt; if (u.life <= 0) uIt.remove() }
++        while (uIt.hasNext()) { val pp = uIt.next(); pp.y -= 40 * u * dt; pp.life -= dt; if (pp.life <= 0) uIt.remove() }
+     }
+ 
+-    private fun invaderX(inv: Invader) = inv.x + sin(time * 2f + inv.phase) * 30 * dp
++    private fun invaderX(inv: Invader) = inv.x + sin(time * 2f + inv.phase) * 30 * u
+ 
+     private fun fire() {
+         bullets += Bullet(shipX, shipY - 4 * px)
+@@ -192,12 +226,12 @@
+         val cx = invaderX(inv); val cy = inv.y + 3 * px
+         repeat(28) {
+             val a = Random.nextFloat() * 6.283f
+-            val sp = (80 + Random.nextFloat() * 260) * dp
+-            particles += Particle(cx, cy, kotlin.math.cos(a) * sp, sin(a) * sp - 120 * dp,
++            val sp = (80 + Random.nextFloat() * 260) * u
++            particles += Particle(cx, cy, kotlin.math.cos(a) * sp, sin(a) * sp - 120 * u,
+                 0.5f + Random.nextFloat() * 0.6f, if (Random.nextBoolean()) inv.color else Color.WHITE)
+         }
+         popups += Popup(cx, cy, 1.2f, "BLOCCATO!")
+-        shake = 10 * dp
++        shake = 10 * u
+         score++
+     }
+ 
+@@ -228,7 +262,7 @@
+     private fun drawInvaders(c: Canvas) {
+         val frame = if ((time * 3).toInt() % 2 == 0) invaderA else invaderB
+         text.textAlign = Paint.Align.CENTER
+-        text.textSize = 10 * dp
++        text.textSize = 10 * u
+         for (inv in invaders) {
+             val x = invaderX(inv)
+             drawSprite(c, frame, x, inv.y, inv.color)
+@@ -237,7 +271,7 @@
+             c.drawRect(x - 2.5f * px, inv.y + 2 * px, x + 2.5f * px, inv.y + 3 * px, paint)
+             text.color = inv.color
+             val label = if (inv.label.length > 24) "…" + inv.label.takeLast(23) else inv.label
+-            c.drawText(label, x, inv.y + 6 * px + 13 * dp, text)
++            c.drawText(label, x, inv.y + 6 * px + 13 * u, text)
+         }
+     }
+ 
+@@ -257,29 +291,29 @@
+ 
+     private fun drawPopups(c: Canvas) {
+         text.textAlign = Paint.Align.CENTER
+-        text.textSize = 14 * dp
+-        for (u in popups) {
+-            text.color = Color.argb((255 * u.life.coerceAtMost(1f)).toInt(), 255, 210, 59)
+-            c.drawText(u.text, u.x, u.y, text)
++        text.textSize = 14 * u
++        for (pp in popups) {
++            text.color = Color.argb((255 * pp.life.coerceAtMost(1f)).toInt(), 255, 210, 59)
++            c.drawText(pp.text, pp.x, pp.y, text)
+         }
+     }
+ 
+     private fun drawHud(c: Canvas) {
+         text.textAlign = Paint.Align.LEFT
+-        text.textSize = 15 * dp
++        text.textSize = 15 * u
+         text.color = Color.WHITE
+-        c.drawText("SCORE %06d".format(score), 16 * dp, 36 * dp, text)
++        c.drawText("SCORE %06d".format(score), 16 * u, 36 * u, text)
+         text.textAlign = Paint.Align.RIGHT
+         text.color = if (shieldOn) green else Color.parseColor("#FF3B5C")
+         val blink = shieldOn || (time * 2).toInt() % 2 == 0
+-        if (blink) c.drawText(if (shieldOn) "SCUDO ON" else "SCUDO OFF", width - 16 * dp, 36 * dp, text)
++        if (blink) c.drawText(if (shieldOn) "SCUDO ON" else "SCUDO OFF", width - 16 * u, 36 * u, text)
+         text.textAlign = Paint.Align.LEFT
+-        text.textSize = 10 * dp
++        text.textSize = 10 * u
+         text.color = Color.argb(160, 255, 255, 255)
+-        c.drawText("LISTA: $listSize DOMINI", 16 * dp, 56 * dp, text)
++        c.drawText("LISTA: $listSize DOMINI", 16 * u, 56 * u, text)
+         if (invaders.isEmpty() && pending.isEmpty()) {
+             text.textAlign = Paint.Align.CENTER
+-            text.textSize = 12 * dp
++            text.textSize = 12 * u
+             text.color = Color.argb(140, 255, 255, 255)
+             c.drawText(if (shieldOn) "IN ATTESA DI INVASORI…" else "ATTIVA LO SCUDO PER INIZIARE", width / 2f, height / 2f, text)
+         }
+diff -ruN -U1 -x .github -x '*.zip' -x README.md old/AdInvaders/app/src/main/java/com/crowclaw/adinvaders/MainActivity.kt AdInvaders/app/src/main/java/com/crowclaw/adinvaders/MainActivity.kt
+--- old/AdInvaders/app/src/main/java/com/crowclaw/adinvaders/MainActivity.kt
++++ AdInvaders/app/src/main/java/com/crowclaw/adinvaders/MainActivity.kt
+@@ -5,7 +5,9 @@
+ import android.graphics.Color
+ import android.graphics.Typeface
+ import android.graphics.drawable.GradientDrawable
++import android.net.Uri
+ import android.net.VpnService
++import android.provider.Settings
+ import android.os.Build
+ import android.os.Bundle
+ import android.os.Handler
+@@ -21,8 +23,14 @@
+ 
+ class MainActivity : AppCompatActivity() {
+ 
++    companion object {
++        /** True mentre l'app è in primo piano: la navicella sui siti resta nascosta. */
++        @Volatile var visible = false
++    }
++
+     private lateinit var game: GameView
+     private lateinit var toggle: Button
++    private lateinit var overlayBtn: Button
+     private val handler = Handler(Looper.getMainLooper())
+     private val listener = BlockEvents.Listener { game.addInvader(it) }
+ 
+@@ -45,6 +53,8 @@
+         override fun run() {
+             game.shieldOn = BlockEvents.vpnRunning
+             toggle.text = if (BlockEvents.vpnRunning) "■ DISATTIVA" else "▶ ATTIVA SCUDO"
++            val on = ShipOverlay.isEnabled(this@MainActivity) && ShipOverlay.canShow(this@MainActivity)
++            overlayBtn.text = if (on) "🚀 SUI SITI: ON" else "🚀 SUI SITI: OFF"
+             handler.postDelayed(this, 1000)
+         }
+     }
+@@ -63,25 +73,42 @@
+             demoAds.shuffled().take(5).forEach(game::addInvader)
+         }
+         val update = retroButton("AGGIORNA LISTA", "#3BC8FF") { downloadList() }
++        overlayBtn = retroButton("🚀 SUI SITI", "#FFD23B") { toggleOverlay() }
+ 
++        val lp = { w: Float -> LinearLayout.LayoutParams(0, (52 * dp).toInt(), w).apply {
++            marginStart = (4 * dp).toInt(); marginEnd = (4 * dp).toInt(); topMargin = (8 * dp).toInt() } }
++        val row1 = LinearLayout(this).apply {
++            addView(toggle, lp(1.2f)); addView(overlayBtn, lp(1.2f))
++        }
++        val row2 = LinearLayout(this).apply {
++            addView(demo, lp(0.8f)); addView(update, lp(1.2f))
++        }
+         val bar = LinearLayout(this).apply {
+-            orientation = LinearLayout.HORIZONTAL
+-            gravity = Gravity.CENTER
++            orientation = LinearLayout.VERTICAL
+             setPadding((12 * dp).toInt(), 0, (12 * dp).toInt(), (24 * dp).toInt())
+-            val lp = { w: Float -> LinearLayout.LayoutParams(0, (52 * dp).toInt(), w).apply { marginStart = (4 * dp).toInt(); marginEnd = (4 * dp).toInt() } }
+-            addView(toggle, lp(1.4f)); addView(demo, lp(0.8f)); addView(update, lp(1.3f))
++            addView(row1); addView(row2)
+         }
+ 
+-        setContentView(FrameLayout(this).apply {
+-            addView(game, FrameLayout.LayoutParams(-1, -1))
+-            addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+-        })
++        // Su tablet la barra resta centrata e larga al massimo 620dp invece di stirarsi
++        val barParams = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
++        val root = object : FrameLayout(this) {
++            override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
++                super.onSizeChanged(w, h, ow, oh)
++                val max = (620 * dp).toInt()
++                val want = if (w > max) max else -1
++                if (barParams.width != want) post { barParams.width = want; bar.layoutParams = barParams }
++            }
++        }
++        root.addView(game, FrameLayout.LayoutParams(-1, -1))
++        root.addView(bar, barParams)
++        setContentView(root)
+ 
+         if (Build.VERSION.SDK_INT >= 33) notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+     }
+ 
+     override fun onResume() {
+         super.onResume()
++        visible = true
+         BlockEvents.add(listener)
+         game.score = AdBlockVpnService.blockedCount(this)
+         game.listSize = BlockList.size
+@@ -90,10 +117,25 @@
+ 
+     override fun onPause() {
+         super.onPause()
++        visible = false
+         BlockEvents.remove(listener)
+         handler.removeCallbacks(refresh)
+     }
+ 
++    private fun toggleOverlay() {
++        if (!ShipOverlay.canShow(this)) {
++            ShipOverlay.setEnabled(this, true)
++            Toast.makeText(this, "Attiva «Mostra sopra altre app» per Ad Invaders", Toast.LENGTH_LONG).show()
++            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
++            return
++        }
++        val on = !ShipOverlay.isEnabled(this)
++        ShipOverlay.setEnabled(this, on)
++        Toast.makeText(this,
++            if (on) "La navicella apparirà sopra i siti quando blocca un annuncio" else "Navicella sui siti disattivata",
++            Toast.LENGTH_SHORT).show()
++    }
++
+     private fun requestShield() {
+         val intent = VpnService.prepare(this)
+         if (intent != null) vpnPermission.launch(intent) else startShield()
+diff -ruN -U1 -x .github -x '*.zip' -x README.md old/AdInvaders/app/src/main/java/com/crowclaw/adinvaders/ShipOverlay.kt AdInvaders/app/src/main/java/com/crowclaw/adinvaders/ShipOverlay.kt
+--- old/AdInvaders/app/src/main/java/com/crowclaw/adinvaders/ShipOverlay.kt
++++ AdInvaders/app/src/main/java/com/crowclaw/adinvaders/ShipOverlay.kt
+@@ -0,0 +1,69 @@
++package com.crowclaw.adinvaders
++
++import android.content.Context
++import android.graphics.PixelFormat
++import android.os.Handler
++import android.os.Looper
++import android.provider.Settings
++import android.view.WindowManager
++
++/**
++ * Finestra trasparente sopra le altre app (browser compreso).
++ * Quando lo scudo blocca un annuncio mentre stai su un sito, la navicella entra dal basso,
++ * abbatte gli invasori nel punto dove c'erano gli annunci e poi se ne va.
++ * Non intercetta mai i tocchi: puoi continuare a usare il sito normalmente.
++ */
++class ShipOverlay(private val context: Context) {
++
++    private val wm = context.getSystemService(WindowManager::class.java)
++    private val main = Handler(Looper.getMainLooper())
++    private var view: GameView? = null
++
++    companion object {
++        private const val PREF = "settings"
++        private const val KEY = "overlay_on"
++
++        fun canShow(ctx: Context) = Settings.canDrawOverlays(ctx)
++
++        fun isEnabled(ctx: Context) =
++            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).getBoolean(KEY, true)
++
++        fun setEnabled(ctx: Context, on: Boolean) =
++            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putBoolean(KEY, on).apply()
++    }
++
++    /** Va chiamato sul main thread. */
++    fun show(domain: String) {
++        if (!isEnabled(context) || !canShow(context)) return
++        if (MainActivity.visible) return            // nell'app c'è già il gioco a schermo intero
++        val v = view ?: create() ?: return
++        v.addInvader(domain)
++    }
++
++    private fun create(): GameView? {
++        val v = GameView(context, overlay = true)
++        val lp = WindowManager.LayoutParams(
++            WindowManager.LayoutParams.MATCH_PARENT,
++            WindowManager.LayoutParams.MATCH_PARENT,
++            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
++            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
++                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
++                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
++            PixelFormat.TRANSLUCENT
++        )
++        v.onIdle = { main.post { hide() } }
++        return try {
++            wm.addView(v, lp)
++            view = v
++            v
++        } catch (_: Exception) {
++            null
++        }
++    }
++
++    fun hide() {
++        val v = view ?: return
++        view = null
++        try { wm.removeView(v) } catch (_: Exception) {}
++    }
++}
