@@ -15,6 +15,10 @@ jobs:
           unzip -q "AdInvaders (1).zip" -d src
           echo "PROJ=$(dirname "$(find src -name settings.gradle.kts | head -1)")" >> $GITHUB_ENV
 
+      - name: Applica aggiornamenti (tablet + navicella sui siti)
+        run: |
+          if [ -f adinv.patch ]; then patch -p1 -d "$PROJ" < adinv.patch; fi
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
